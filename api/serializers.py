@@ -75,11 +75,23 @@ class PropertySerializer(serializers.ModelSerializer):
 
 
 class PaymentSerializer(serializers.ModelSerializer):
+    # Read-only booking totals, so each payment response shows where the
+    # booking stands after this payment is applied.
+    booking_total = serializers.DecimalField(
+        source='booking.total_amount', max_digits=10, decimal_places=2, read_only=True)
+    booking_paid = serializers.DecimalField(
+        source='booking.advance_amount', max_digits=10, decimal_places=2, read_only=True)
+    booking_balance = serializers.DecimalField(
+        source='booking.balance_amount', max_digits=10, decimal_places=2, read_only=True)
+    payment_status = serializers.CharField(
+        source='booking.payment_status', read_only=True)
+
     class Meta:
         model = Payment
         fields = [
             'id', 'booking', 'amount', 'payment_method',
             'payment_date', 'reference', 'notes', 'received_at',
+            'booking_total', 'booking_paid', 'booking_balance', 'payment_status',
         ]
         read_only_fields = ['received_at']
 

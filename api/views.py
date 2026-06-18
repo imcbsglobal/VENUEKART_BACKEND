@@ -141,6 +141,37 @@ class BookingViewSet(viewsets.ModelViewSet):
 
 
 # ---------------------------------------------------------------------------
+# Payments
+# ---------------------------------------------------------------------------
+# Full CRUD for payments. Creating or deleting a Payment automatically
+# updates the parent booking's advance_amount / balance_amount /
+# payment_status (handled in Payment.save() / Payment.delete()), so no
+# extra recalculation is needed here.
+#
+#   GET    /api/payments/                list all payments
+#   GET    /api/payments/?booking=<id>   list payments for one booking
+#   POST   /api/payments/                record a payment
+#   GET    /api/payments/<id>/           retrieve one payment
+#   DELETE /api/payments/<id>/           remove a payment (refunds balance)
+#
+# Note: BookingViewSet.add_payment (POST /api/bookings/<id>/add_payment/)
+# also creates a payment and returns the updated booking — keep using that
+# if the mobile screen already has the booking id in hand.
+
+class PaymentViewSet(viewsets.ModelViewSet):
+    queryset = Payment.objects.select_related('booking').order_by('received_at')
+    serializer_class = PaymentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        booking_id = self.request.query_params.get('booking')
+        if booking_id:
+            qs = qs.filter(booking_id=booking_id)
+        return qs
+
+
+# ---------------------------------------------------------------------------
 # Availability check — given a property + date, says which of its slot
 # types are free. For hourly slots it also returns the open sub-windows
 # left on that date, since hourly bookings are a custom start+duration now.

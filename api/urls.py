@@ -1,7 +1,7 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
-    PropertyViewSet, BookingViewSet,
+    PropertyViewSet, BookingViewSet, PaymentViewSet,
     CalendarView, DashboardView, AvailabilityCheckView, ReportView,
     LoginView, LogoutView, MeView,
 )
@@ -9,11 +9,7 @@ from .views import (
 router = DefaultRouter()
 router.register('properties', PropertyViewSet, basename='property')
 router.register('bookings', BookingViewSet, basename='booking')
-# NOTE: 'slots' route removed — SlotViewSet/Slot no longer exist as a
-# standalone resource. Slots are now created/edited as part of the
-# Property payload (see PropertySerializer.slots) and read via
-# property.slots in the API response. You'll need to delete the
-# SlotViewSet class from views.py once you share that file.
+router.register('payments', PaymentViewSet, basename='payment')
 
 urlpatterns = [
     path('', include(router.urls)),

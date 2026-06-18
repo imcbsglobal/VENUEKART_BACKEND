@@ -225,7 +225,7 @@ class Payment(models.Model):
     booking = models.ForeignKey(Booking, on_delete=models.CASCADE, related_name='payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     payment_method = models.CharField(max_length=30, choices=PAYMENT_METHODS, default='cash')
-    payment_date = models.DateField(default=timezone.now)
+    payment_date = models.DateField(default=timezone.localdate)
     reference = models.CharField(max_length=100, blank=True)
     notes = models.TextField(blank=True)
     received_at = models.DateTimeField(auto_now_add=True)
