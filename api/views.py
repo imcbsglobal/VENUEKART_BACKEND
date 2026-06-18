@@ -1,7 +1,11 @@
 import calendar
+import json
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 
 from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.models import User as DjangoUser
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
 
@@ -373,22 +377,121 @@ class ReportView(APIView):
 # ---------------------------------------------------------------------------
 
 class LoginView(APIView):
+    """
+    POST /api/login/
+    Body: { email, client_id, password }
+
+    Flow
+    ────
+    1. Call the VenueKart activation API and confirm the supplied client_id
+       exists, is Active, and its licence has not expired.
+    2. Look up the Django user by e-mail address.
+    3. Authenticate with Django's password checker.
+    4. Return an auth token plus licence metadata.
+    """
+
     permission_classes = [permissions.AllowAny]
+    ACTIVATE_API = 'https://activate.imcbs.com/mobileapp/api/project/venuekart/'
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _fetch_licence_data(self):
+        """GETs the VenueKart activation endpoint; returns parsed JSON or None."""
+        req = urllib.request.Request(
+            self.ACTIVATE_API,
+            headers={'User-Agent': 'VenueBook/1.0', 'Accept': 'application/json'},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except (urllib.error.URLError, ValueError, OSError):
+            return None
+
+    # ── POST ─────────────────────────────────────────────────────────────────
 
     def post(self, request):
-        username = request.data.get('username')
-        password = request.data.get('password')
-        user = authenticate(request, username=username, password=password)
+        email     = (request.data.get('email')     or '').strip().lower()
+        client_id = (request.data.get('client_id') or '').strip().upper()
+        password  = (request.data.get('password')  or '')
 
+        if not email or not client_id or not password:
+            return Response(
+                {'detail': 'Email, Client ID, and password are all required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Step 1: validate client_id via VenueKart activation API ─────────
+        api_data = self._fetch_licence_data()
+        if api_data is None or not api_data.get('success'):
+            return Response(
+                {'detail': 'Unable to reach the licence server. Please try again later.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        customers = api_data.get('customers', [])
+        matched   = next(
+            (c for c in customers if (c.get('client_id') or '').upper() == client_id),
+            None,
+        )
+
+        if not matched:
+            return Response(
+                {'detail': 'Invalid Client ID – not registered for VenueKart.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if (matched.get('status') or '').lower() != 'active':
+            return Response(
+                {'detail': 'Your Client ID is inactive. Please contact support.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        validity = matched.get('license_validity', {})
+        if validity.get('is_expired', True):
+            expiry = validity.get('expiry_date', 'N/A')
+            return Response(
+                {'detail': f'Your VenueKart licence expired on {expiry}. Please renew to continue.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # ── Step 2: look up user by email ────────────────────────────────────
+        try:
+            user_obj = DjangoUser.objects.get(email__iexact=email)
+        except DjangoUser.DoesNotExist:
+            return Response(
+                {'detail': 'No account found with this email address.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except DjangoUser.MultipleObjectsReturned:
+            return Response(
+                {'detail': 'Multiple accounts share this email. Please contact support.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Step 3: verify password ───────────────────────────────────────────
+        user = authenticate(request, username=user_obj.username, password=password)
         if user is None:
-            return Response({'error': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {'detail': 'Incorrect password. Please try again.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         login(request, user)
         token, _ = Token.objects.get_or_create(user=user)
+
         return Response({
             'token': token.key,
-            'username': user.username,
-            'is_superuser': user.is_superuser,
+            'user': {
+                'username':     user.username,
+                'email':        user.email,
+                'is_superuser': user.is_superuser,
+            },
+            'client': {
+                'client_id':      matched['client_id'],
+                'customer_name':  matched.get('customer_name', ''),
+                'license_expiry': validity.get('expiry_date'),
+                'remaining_days': validity.get('remaining_days'),
+            },
         })
 
 
