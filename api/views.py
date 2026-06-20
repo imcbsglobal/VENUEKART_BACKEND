@@ -87,6 +87,18 @@ class BookingViewSet(viewsets.ModelViewSet):
             return BookingListSerializer
         return BookingDetailSerializer
 
+    def create(self, request, *args, **kwargs):
+        # Create via the detail serializer (it computes total_amount,
+        # validates overlaps, etc.), but RETURN the flat list serializer so
+        # the response shows customer_name / advance_amount / balance up top
+        # instead of burying them under the full nested property block.
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        out = BookingListSerializer(serializer.instance, context=self.get_serializer_context())
+        headers = self.get_success_headers(out.data)
+        return Response(out.data, status=status.HTTP_201_CREATED, headers=headers)
+
     def get_queryset(self):
         qs = super().get_queryset()
         status_param = self.request.query_params.get('status')

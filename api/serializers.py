@@ -1,3 +1,4 @@
+from decimal import Decimal
 from rest_framework import serializers
 from django.db.models import Q
 from .models import Property, PropertyImage, PropertySlot, Booking, Payment
@@ -166,7 +167,7 @@ class BookingDetailSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     f"Maximum booking duration for this slot is {property_slot.max_duration_hours} hours."
                 )
-            data['total_amount'] = round(float(property_slot.price) * duration, 2)
+            data['total_amount'] = Decimal(str(round(float(property_slot.price) * duration, 2)))
         else:
             # full_day / half_day: flat price regardless of the times entered.
             data['total_amount'] = property_slot.price
