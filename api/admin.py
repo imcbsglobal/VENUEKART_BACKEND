@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment
+from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment, Enquiry
 
 
 # ---------------------------------------------------------------------------
@@ -98,3 +98,19 @@ class PaymentAdmin(admin.ModelAdmin):
     list_display = ['booking', 'client', 'amount', 'payment_method', 'payment_date', 'received_at']
     list_filter = ['client', 'payment_method']
     search_fields = ['booking__booking_number', 'booking__customer_name', 'reference']
+
+
+# ---------------------------------------------------------------------------
+# Enquiry
+# ---------------------------------------------------------------------------
+
+@admin.register(Enquiry)
+class EnquiryAdmin(admin.ModelAdmin):
+    list_display = [
+        'enquiry_number', 'client', 'customer_name', 'mobile_number',
+        'property', 'enquiry_date', 'event_name', 'status', 'created_at',
+    ]
+    list_filter = ['client', 'status', 'property']
+    search_fields = ['enquiry_number', 'customer_name', 'mobile_number', 'event_name']
+    readonly_fields = ['enquiry_number', 'booking', 'created_at', 'updated_at']
+    date_hierarchy = 'created_at'

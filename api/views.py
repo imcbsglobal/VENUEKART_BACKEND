@@ -15,7 +15,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment
+from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment, Enquiry
 from .serializers import (
     ClientSerializer,
     UserSerializer,
@@ -27,6 +27,7 @@ from .serializers import (
     BookingDetailSerializer,
     PaymentSerializer,
     DashboardSerializer,
+    EnquirySerializer,
 )
 
 
@@ -296,9 +297,12 @@ class BookingViewSet(viewsets.ModelViewSet):
     def update_status(self, request, pk=None):
         booking = self.get_object()
         new_status = request.data.get('status')
-        valid_statuses = [c[0] for c in Booking.BOOKING_STATUS]
+        valid_statuses = [c[0] for c in Booking.BOOKING_STATUS]  # reserved, completed, cancelled
         if new_status not in valid_statuses:
-            return Response({'error': 'Invalid status.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': f"Invalid status. Must be one of: {', '.join(valid_statuses)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         booking.status = new_status
         booking.save()
         return Response(BookingDetailSerializer(booking).data)
@@ -318,6 +322,150 @@ class BookingViewSet(viewsets.ModelViewSet):
         booking.status = 'cancelled'
         booking.save()
         return Response(BookingDetailSerializer(booking).data)
+
+
+# ---------------------------------------------------------------------------
+# Enquiries
+# ---------------------------------------------------------------------------
+
+class EnquiryViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for Enquiries (lightweight leads — no payment, no slot lock).
+
+    GET    /api/enquiries/                   list (filterable by status, property, search)
+    POST   /api/enquiries/                   create a new enquiry
+    GET    /api/enquiries/<id>/              retrieve
+    PATCH  /api/enquiries/<id>/              update
+    DELETE /api/enquiries/<id>/              delete
+
+    PATCH  /api/enquiries/<id>/promote/      promote enquiry → Booking (status=reserved)
+    """
+    queryset = Enquiry.objects.select_related('property', 'property_slot', 'booking').all()
+    serializer_class = EnquirySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = _client_scope(super().get_queryset(), self.request, field='client')
+
+        status_param = self.request.query_params.get('status')
+        property_id = self.request.query_params.get('property')
+        search = self.request.query_params.get('search')
+
+        if status_param:
+            qs = qs.filter(status=status_param)
+        if property_id:
+            qs = qs.filter(property_id=property_id)
+        if search:
+            qs = qs.filter(
+                Q(enquiry_number__icontains=search)
+                | Q(customer_name__icontains=search)
+                | Q(mobile_number__icontains=search)
+                | Q(event_name__icontains=search)
+            )
+        return qs
+
+    def perform_create(self, serializer):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        client = _get_client(self.request)
+        if client is None and not _is_super(self.request):
+            raise permissions.PermissionDenied("No client profile attached to your account.")
+        if client:
+            serializer.save(client=client)
+        else:
+            client_id = self.request.data.get('client_id', '').strip().upper()
+            try:
+                supplied_client = Client.objects.get(client_id=client_id)
+            except Client.DoesNotExist:
+                raise DRFValidationError({"client_id": f"Client '{client_id}' not found."})
+            serializer.save(client=supplied_client)
+
+    @action(detail=True, methods=['patch'], url_path='promote')
+    def promote(self, request, pk=None):
+        """
+        Promote an enquiry to a confirmed Booking.
+        The enquiry must have property, property_slot, enquiry_date,
+        start_time and end_time set — all required for a proper Booking.
+        On success: creates the Booking (status=reserved), links it back to
+        the enquiry, and sets enquiry.status = 'reserved'.
+        """
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        from decimal import Decimal
+
+        enquiry = self.get_object()
+
+        if enquiry.status == 'reserved':
+            return Response({'detail': 'This enquiry has already been promoted to a booking.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        missing = [f for f, v in [
+            ('property_slot', enquiry.property_slot_id),
+            ('enquiry_date', enquiry.enquiry_date),
+            ('start_time', enquiry.start_time),
+            ('end_time', enquiry.end_time),
+        ] if not v]
+        if missing:
+            return Response(
+                {'detail': f"Cannot promote: missing fields — {', '.join(missing)}. Update the enquiry first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        slot = enquiry.property_slot
+        start = enquiry.start_time
+        end = enquiry.end_time
+
+        if end <= start:
+            return Response({'detail': 'end_time must be after start_time.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate total amount
+        if slot.slot_type == 'hourly':
+            duration = (end.hour * 3600 + end.minute * 60 - start.hour * 3600 - start.minute * 60) / 3600
+            total = Decimal(str(round(float(slot.price) * duration, 2)))
+        else:
+            total = slot.price
+
+        # Check for conflicts
+        conflict = Booking.objects.filter(
+            property=enquiry.property,
+            booking_date=enquiry.enquiry_date,
+            status__in=['reserved'],
+        ).exclude(
+            Q(end_time__lte=start) | Q(start_time__gte=end)
+        )
+        if conflict.exists():
+            return Response(
+                {'detail': 'Cannot promote: the slot is already reserved for another booking at that time.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        booking_client = enquiry.client
+        if booking_client is None and not _is_super(request):
+            raise permissions.PermissionDenied("No client profile attached to this enquiry.")
+
+        booking = Booking.objects.create(
+            client=booking_client,
+            property=enquiry.property,
+            property_slot=slot,
+            customer_name=enquiry.customer_name,
+            mobile_number=enquiry.mobile_number,
+            event_name=enquiry.event_name or enquiry.customer_name,
+            event_type=enquiry.event_type or 'other',
+            booking_date=enquiry.enquiry_date,
+            start_time=start,
+            end_time=end,
+            total_amount=total,
+            advance_amount=Decimal('0'),
+            notes=enquiry.notes,
+            status='reserved',
+        )
+
+        enquiry.booking = booking
+        enquiry.status = 'reserved'
+        enquiry.save(update_fields=['booking', 'status', 'updated_at'])
+
+        return Response({
+            'detail': 'Enquiry promoted to booking successfully.',
+            'booking': BookingListSerializer(booking).data,
+            'enquiry': EnquirySerializer(enquiry).data,
+        }, status=status.HTTP_201_CREATED)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +517,7 @@ class AvailabilityCheckView(APIView):
         existing = Booking.objects.filter(
             property=property_obj,
             booking_date=booking_date,
-            status__in=['reserved', 'booked', 'confirmed', 'occupied'],
+            status__in=['reserved'],
         ).order_by('start_time')
 
         busy_ranges = [
@@ -390,8 +538,9 @@ class AvailabilityCheckView(APIView):
 # ---------------------------------------------------------------------------
 
 STATUS_COLORS = {
-    'inquiry': '#6B7280', 'reserved': '#F59E0B', 'booked': '#3B82F6',
-    'confirmed': '#F97316', 'occupied': '#EF4444', 'completed': '#10B981', 'cancelled': '#374151',
+    'reserved': '#F59E0B', 'completed': '#10B981', 'cancelled': '#374151',
+    # Enquiry statuses (used in calendar for promoted enquiries)
+    'enquiry': '#6B7280',
 }
 
 

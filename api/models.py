@@ -261,11 +261,7 @@ class PropertySlot(models.Model):
 
 class Booking(models.Model):
     BOOKING_STATUS = [
-        ('inquiry', 'Inquiry'),
         ('reserved', 'Reserved'),
-        ('booked', 'Booked'),
-        ('confirmed', 'Confirmed'),
-        ('occupied', 'Occupied'),
         ('completed', 'Completed'),
         ('cancelled', 'Cancelled'),
     ]
@@ -310,7 +306,7 @@ class Booking(models.Model):
     payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='pending')
 
     notes = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=BOOKING_STATUS, default='inquiry')
+    status = models.CharField(max_length=20, choices=BOOKING_STATUS, default='reserved')
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -345,7 +341,7 @@ class Booking(models.Model):
             conflict_qs = Booking.objects.filter(
                 property_id=self.property_id,
                 booking_date=self.booking_date,
-                status__in=['reserved', 'booked', 'confirmed', 'occupied'],
+                status__in=['reserved'],
             ).exclude(
                 models.Q(end_time__lte=self.start_time) | models.Q(start_time__gte=self.end_time)
             )
@@ -405,3 +401,62 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"{self.booking.booking_number} – ₹{self.amount}"
+
+
+# ---------------------------------------------------------------------------
+# Enquiry — lightweight lead capture; no payment, no slot conflict lock
+# ---------------------------------------------------------------------------
+
+class Enquiry(models.Model):
+    ENQUIRY_STATUS = [
+        ('enquiry', 'Enquiry'),
+        ('reserved', 'Reserved'),
+    ]
+    EVENT_TYPES = Booking.EVENT_TYPES  # reuse same list
+
+    # ── tenant scope ──────────────────────────────────────────────────────────
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='enquiries', null=True)
+
+    enquiry_number = models.CharField(max_length=20, unique=True, editable=False)
+    property = models.ForeignKey(Property, on_delete=models.PROTECT, related_name='enquiries')
+    property_slot = models.ForeignKey(
+        PropertySlot, on_delete=models.PROTECT, related_name='enquiries',
+        null=True, blank=True,
+    )
+
+    customer_name = models.CharField(max_length=255)
+    mobile_number = models.CharField(max_length=20)
+    email = models.EmailField(blank=True)
+
+    event_name = models.CharField(max_length=255, blank=True)
+    event_type = models.CharField(max_length=50, choices=EVENT_TYPES, blank=True)
+
+    enquiry_date = models.DateField(null=True, blank=True)   # prospective event date
+    start_time = models.TimeField(null=True, blank=True)
+    end_time = models.TimeField(null=True, blank=True)
+
+    notes = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=ENQUIRY_STATUS, default='enquiry')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # When the enquiry is promoted to a booking, we store the FK here.
+    booking = models.OneToOneField(
+        Booking, on_delete=models.SET_NULL,
+        related_name='enquiry', null=True, blank=True,
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name_plural = 'Enquiries'
+
+    def save(self, *args, **kwargs):
+        if not self.enquiry_number:
+            last = Enquiry.objects.order_by('-id').first()
+            next_id = (last.id + 1) if last else 1
+            self.enquiry_number = f"ENQ{timezone.now().strftime('%Y%m')}{next_id:04d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.enquiry_number} – {self.customer_name} @ {self.property.name}"

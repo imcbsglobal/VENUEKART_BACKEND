@@ -5,6 +5,7 @@ from .views import (
     UserViewSet,
     PropertyViewSet,
     BookingViewSet,
+    EnquiryViewSet,
     PaymentViewSet,
     CalendarView,
     DashboardView,
@@ -23,6 +24,7 @@ router.register('users',   UserViewSet,   basename='user')     # user CRUD
 
 # ── Core resources (tenant-scoped by the views) ───────────────────────────────
 router.register('properties', PropertyViewSet, basename='property')
+router.register('enquiries',  EnquiryViewSet,  basename='enquiry')
 router.register('bookings',   BookingViewSet,  basename='booking')
 router.register('payments',   PaymentViewSet,  basename='payment')
 

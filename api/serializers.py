@@ -2,7 +2,7 @@ from decimal import Decimal
 from rest_framework import serializers
 from django.db.models import Q
 from django.contrib.auth.models import User as DjangoUser
-from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment
+from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment, Enquiry
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +293,7 @@ class BookingDetailSerializer(serializers.ModelSerializer):
         conflict_qs = Booking.objects.filter(
             property=property_obj,
             booking_date=booking_date,
-            status__in=['reserved', 'booked', 'confirmed', 'occupied'],
+            status__in=['reserved'],
         ).exclude(
             Q(end_time__lte=start) | Q(start_time__gte=end)
         )
@@ -338,3 +338,29 @@ class DashboardSerializer(serializers.Serializer):
     upcoming_events = BookingListSerializer(many=True)
     status_breakdown = serializers.DictField()
     monthly_revenue = serializers.ListField()
+
+
+# ---------------------------------------------------------------------------
+# Enquiry
+# ---------------------------------------------------------------------------
+
+class EnquirySerializer(serializers.ModelSerializer):
+    property_name = serializers.CharField(source='property.name', read_only=True)
+    slot_type = serializers.CharField(source='property_slot.slot_type', read_only=True, allow_null=True)
+    booking_number = serializers.CharField(source='booking.booking_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = Enquiry
+        fields = [
+            'id', 'enquiry_number',
+            'property', 'property_name',
+            'property_slot', 'slot_type',
+            'customer_name', 'mobile_number', 'email',
+            'event_name', 'event_type',
+            'enquiry_date', 'start_time', 'end_time',
+            'notes', 'status',
+            'booking', 'booking_number',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['enquiry_number', 'booking', 'created_at', 'updated_at']
+        extra_kwargs = {'property_slot': {'required': False, 'allow_null': True}}
