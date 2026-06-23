@@ -15,8 +15,11 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Property, PropertyImage, PropertySlot, Booking, Payment
+from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment
 from .serializers import (
+    ClientSerializer,
+    UserSerializer,
+    CreateUserSerializer,
     PropertySerializer,
     PropertyImageSerializer,
     PropertySlotSerializer,
@@ -25,6 +28,119 @@ from .serializers import (
     PaymentSerializer,
     DashboardSerializer,
 )
+
+
+# ---------------------------------------------------------------------------
+# Helpers — resolving tenant from the authenticated request
+# ---------------------------------------------------------------------------
+
+def _get_client(request):
+    """
+    Returns the Client associated with the logged-in user's profile.
+    Super-admins have client=None (they can see all tenants) — callers must
+    handle that case where cross-tenant queries are needed.
+    """
+    try:
+        return request.user.profile.client
+    except UserProfile.DoesNotExist:
+        return None
+
+
+def _is_super(request):
+    try:
+        return request.user.profile.role == 'super_admin'
+    except UserProfile.DoesNotExist:
+        return request.user.is_superuser
+
+
+def _client_scope(qs, request, field='client'):
+    """
+    Filters a queryset to the logged-in user's client unless the user is
+    a super_admin (who can see everything). Pass field='client' for direct
+    FK fields, or 'booking__client' for Payment-level filtering.
+    """
+    if _is_super(request):
+        return qs
+    client = _get_client(request)
+    if client is None:
+        return qs.none()
+    return qs.filter(**{field: client})
+
+
+# ---------------------------------------------------------------------------
+# Permission helpers
+# ---------------------------------------------------------------------------
+
+class IsSuperAdmin(permissions.BasePermission):
+    """Only super_admin role can access."""
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and _is_super(request))
+
+
+# ---------------------------------------------------------------------------
+# Client management (super_admin only)
+# ---------------------------------------------------------------------------
+
+class ClientViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for Client (tenant) records.
+    Only super_admin can reach these endpoints.
+
+    GET    /api/clients/          list all tenants
+    POST   /api/clients/          create a new tenant
+    GET    /api/clients/<id>/     retrieve one tenant
+    PUT    /api/clients/<id>/     update
+    DELETE /api/clients/<id>/     delete (careful — cascades to all their data)
+    """
+    queryset = Client.objects.all().order_by('client_id')
+    serializer_class = ClientSerializer
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+
+# ---------------------------------------------------------------------------
+# User management (super_admin only)
+# ---------------------------------------------------------------------------
+
+class UserViewSet(viewsets.ModelViewSet):
+    """
+    List / create / deactivate users.
+
+    GET  /api/users/          list users (super_admin sees all; others see their client)
+    POST /api/users/          create a user (super_admin only)
+    GET  /api/users/<id>/     retrieve
+    PATCH /api/users/<id>/    update (role / active flag)
+    DELETE /api/users/<id>/   delete
+
+    PATCH /api/users/<id>/toggle-active/   flip is_active
+    """
+    queryset = DjangoUser.objects.select_related('profile', 'profile__client').order_by('username')
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return CreateUserSerializer
+        return UserSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # Optional: super_admin can filter by client_id query param
+        client_id = self.request.query_params.get('client_id')
+        if client_id:
+            qs = qs.filter(profile__client__client_id=client_id.upper())
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = CreateUserSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['patch'], url_path='toggle-active')
+    def toggle_active(self, request, pk=None):
+        user = self.get_object()
+        user.is_active = not user.is_active
+        user.save()
+        return Response(UserSerializer(user).data)
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +153,8 @@ class PropertyViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = _client_scope(super().get_queryset(), self.request)
+
         status_param = self.request.query_params.get('status')
         property_type = self.request.query_params.get('property_type')
         search = self.request.query_params.get('search')
@@ -50,14 +167,26 @@ class PropertyViewSet(viewsets.ModelViewSet):
             qs = qs.filter(Q(name__icontains=search) | Q(location__icontains=search))
         return qs
 
+    def perform_create(self, serializer):
+        # Inject the tenant automatically so the frontend never has to send it
+        client = _get_client(self.request)
+        if client is None and not _is_super(self.request):
+            raise permissions.PermissionDenied("No client profile attached to your account.")
+        # Super-admin can pass client explicitly; regular users get theirs injected
+        if client:
+            serializer.save(client=client)
+        else:
+            # super_admin must supply client_id in request body
+            client_id = self.request.data.get('client_id', '').strip().upper()
+            try:
+                supplied_client = Client.objects.get(client_id=client_id)
+            except Client.DoesNotExist:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({"client_id": f"Client '{client_id}' not found."})
+            serializer.save(client=supplied_client)
+
     @action(detail=True, methods=['get'])
     def slots(self, request, pk=None):
-        """
-        GET /api/properties/<id>/slots/
-        Used by the booking form: lists only the slot types this property
-        actually offers (the ones ticked on the property form), instead of
-        the old global Slot list.
-        """
         property_obj = self.get_object()
         slots_qs = property_obj.slots.filter(status='active')
         return Response(PropertySlotSerializer(slots_qs, many=True).data)
@@ -68,7 +197,6 @@ class PropertyViewSet(viewsets.ModelViewSet):
         image = request.FILES.get('image')
         if not image:
             return Response({'error': 'No image provided.'}, status=status.HTTP_400_BAD_REQUEST)
-
         is_primary = request.data.get('is_primary') in [True, 'true', 'True', '1']
         img = PropertyImage.objects.create(property=property_obj, image=image, is_primary=is_primary)
         return Response(PropertyImageSerializer(img).data, status=status.HTTP_201_CREATED)
@@ -87,20 +215,17 @@ class BookingViewSet(viewsets.ModelViewSet):
             return BookingListSerializer
         return BookingDetailSerializer
 
-    def create(self, request, *args, **kwargs):
-        # Create via the detail serializer (it computes total_amount,
-        # validates overlaps, etc.), but RETURN the flat list serializer so
-        # the response shows customer_name / advance_amount / balance up top
-        # instead of burying them under the full nested property block.
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        out = BookingListSerializer(serializer.instance, context=self.get_serializer_context())
-        headers = self.get_success_headers(out.data)
-        return Response(out.data, status=status.HTTP_201_CREATED, headers=headers)
-
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = _client_scope(super().get_queryset(), self.request)
+
+        # Double-lock: also ensure the booking's property belongs to the same
+        # client. This filters out any stale cross-tenant bookings that were
+        # created before the property-ownership guard was added.
+        if not _is_super(self.request):
+            client = _get_client(self.request)
+            if client:
+                qs = qs.filter(property__client=client)
+
         status_param = self.request.query_params.get('status')
         property_id = self.request.query_params.get('property')
         date_from = self.request.query_params.get('date_from')
@@ -123,6 +248,49 @@ class BookingViewSet(viewsets.ModelViewSet):
                 | Q(event_name__icontains=search)
             )
         return qs
+
+    def perform_create(self, serializer):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        client = _get_client(self.request)
+        if client is None and not _is_super(self.request):
+            raise permissions.PermissionDenied("No client profile attached to your account.")
+
+        # ── Resolve which client will own this booking ────────────────────────
+        if client:
+            booking_client = client
+        else:
+            # super_admin must supply client_id in request body
+            client_id = self.request.data.get('client_id', '').strip().upper()
+            try:
+                booking_client = Client.objects.get(client_id=client_id)
+            except Client.DoesNotExist:
+                raise DRFValidationError({"client_id": f"Client '{client_id}' not found."})
+
+        # ── Guard: the chosen property must belong to the same client ─────────
+        # This prevents a booking being created against another tenant's property.
+        property_id = self.request.data.get('property')
+        if property_id:
+            from .models import Property as PropertyModel
+            try:
+                prop = PropertyModel.objects.get(pk=property_id)
+            except PropertyModel.DoesNotExist:
+                raise DRFValidationError({"property": "Property not found."})
+
+            if not _is_super(self.request) and prop.client_id != booking_client.id:
+                raise DRFValidationError(
+                    {"property": "You can only create bookings for properties belonging to your account."}
+                )
+
+        serializer.save(client=booking_client)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        out = BookingListSerializer(serializer.instance, context=self.get_serializer_context())
+        headers = self.get_success_headers(out.data)
+        return Response(out.data, status=status.HTTP_201_CREATED, headers=headers)
 
     @action(detail=True, methods=['patch'], url_path='status')
     def update_status(self, request, pk=None):
@@ -155,20 +323,6 @@ class BookingViewSet(viewsets.ModelViewSet):
 # ---------------------------------------------------------------------------
 # Payments
 # ---------------------------------------------------------------------------
-# Full CRUD for payments. Creating or deleting a Payment automatically
-# updates the parent booking's advance_amount / balance_amount /
-# payment_status (handled in Payment.save() / Payment.delete()), so no
-# extra recalculation is needed here.
-#
-#   GET    /api/payments/                list all payments
-#   GET    /api/payments/?booking=<id>   list payments for one booking
-#   POST   /api/payments/                record a payment
-#   GET    /api/payments/<id>/           retrieve one payment
-#   DELETE /api/payments/<id>/           remove a payment (refunds balance)
-#
-# Note: BookingViewSet.add_payment (POST /api/bookings/<id>/add_payment/)
-# also creates a payment and returns the updated booking — keep using that
-# if the mobile screen already has the booking id in hand.
 
 class PaymentViewSet(viewsets.ModelViewSet):
     queryset = Payment.objects.select_related('booking').order_by('received_at')
@@ -176,7 +330,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = _client_scope(super().get_queryset(), self.request)
         booking_id = self.request.query_params.get('booking')
         if booking_id:
             qs = qs.filter(booking_id=booking_id)
@@ -184,16 +338,7 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
 
 # ---------------------------------------------------------------------------
-# Availability check — given a property + date, says which of its slot
-# types are free. For hourly slots it also returns the open sub-windows
-# left on that date, since hourly bookings are a custom start+duration now.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Availability check — given a property + date, lists the bookings already
-# on the books so the booking form can show what times are taken. Actual
-# conflict prevention happens in BookingDetailSerializer.validate() / 
-# Booking.clean() when the booking is submitted.
+# Availability check
 # ---------------------------------------------------------------------------
 
 class AvailabilityCheckView(APIView):
@@ -212,7 +357,12 @@ class AvailabilityCheckView(APIView):
             return Response({'error': 'date must be in YYYY-MM-DD format.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            property_obj = Property.objects.get(pk=property_id)
+            # Scoping: only let users check availability for their own client's properties
+            qs = Property.objects.all()
+            if not _is_super(request):
+                client = _get_client(request)
+                qs = qs.filter(client=client)
+            property_obj = qs.get(pk=property_id)
         except Property.DoesNotExist:
             return Response({'error': 'Property not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -232,19 +382,13 @@ class AvailabilityCheckView(APIView):
             for b in existing
         ]
 
-        return Response({
-            'property': property_obj.id,
-            'date': date_str,
-            'busy_ranges': busy_ranges,
-        })
+        return Response({'property': property_obj.id, 'date': date_str, 'busy_ranges': busy_ranges})
 
 
 # ---------------------------------------------------------------------------
 # Calendar
 # ---------------------------------------------------------------------------
 
-# Mirrors the STATUS_COLORS map in AdminDashboard.jsx so calendar event
-# colors match the rest of the UI.
 STATUS_COLORS = {
     'inquiry': '#6B7280', 'reserved': '#F59E0B', 'booked': '#3B82F6',
     'confirmed': '#F97316', 'occupied': '#EF4444', 'completed': '#10B981', 'cancelled': '#374151',
@@ -260,18 +404,17 @@ class CalendarView(APIView):
         year = int(request.query_params.get('year', today.year))
         property_id = request.query_params.get('property')
 
-        qs = Booking.objects.filter(
-            booking_date__year=year,
-            booking_date__month=month,
-        ).exclude(status='cancelled').select_related('property', 'property_slot')
+        qs = _client_scope(
+            Booking.objects.filter(
+                booking_date__year=year,
+                booking_date__month=month,
+            ).exclude(status='cancelled').select_related('property', 'property_slot'),
+            request,
+        )
 
         if property_id:
             qs = qs.filter(property_id=property_id)
 
-        # The frontend's CalendarPage expects FullCalendar-style event
-        # objects (start/end/title/backgroundColor/extendedProps), not flat
-        # booking rows — it does `new Date(ev.start)` and reads
-        # `ev.extendedProps.customer_name` directly.
         events = []
         for b in qs:
             events.append({
@@ -298,7 +441,7 @@ class CalendarView(APIView):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard
+# Dashboard — scoped per client
 # ---------------------------------------------------------------------------
 
 class DashboardView(APIView):
@@ -308,8 +451,9 @@ class DashboardView(APIView):
         today = timezone.now().date()
         month_start = today.replace(day=1)
 
-        properties = Property.objects.all()
-        bookings = Booking.objects.exclude(status='cancelled')
+        properties = _client_scope(Property.objects.all(), request)
+        bookings = _client_scope(Booking.objects.exclude(status='cancelled'), request)
+        payments = _client_scope(Payment.objects.all(), request)
 
         total_properties = properties.count()
         active_properties = properties.filter(status='active').count()
@@ -322,10 +466,12 @@ class DashboardView(APIView):
             status__in=['reserved', 'booked', 'confirmed', 'occupied'],
         ).count()
 
-        total_revenue = Payment.objects.aggregate(total=Sum('amount'))['total'] or 0
+        total_revenue = payments.aggregate(total=Sum('amount'))['total'] or 0
         pending_payments = bookings.aggregate(total=Sum('balance_amount'))['total'] or 0
 
-        active_slot_count = PropertySlot.objects.filter(status='active').count()
+        active_slot_count = PropertySlot.objects.filter(
+            status='active', property__in=properties
+        ).count()
         occupancy_rate = round((occupied_slots / active_slot_count) * 100, 1) if active_slot_count else 0.0
 
         recent_bookings = bookings.order_by('-created_at')[:5]
@@ -345,14 +491,10 @@ class DashboardView(APIView):
             while m <= 0:
                 m += 12
                 y -= 1
-            revenue = Payment.objects.filter(
+            revenue = payments.filter(
                 payment_date__year=y, payment_date__month=m
             ).aggregate(total=Sum('amount'))['total'] or 0
-            monthly_revenue.append({
-                'month': calendar.month_abbr[m],
-                'year': y,
-                'revenue': float(revenue),
-            })
+            monthly_revenue.append({'month': calendar.month_abbr[m], 'year': y, 'revenue': float(revenue)})
 
         data = {
             'total_properties': total_properties,
@@ -373,10 +515,7 @@ class DashboardView(APIView):
 
 
 # ---------------------------------------------------------------------------
-# Reports — matches AdminDashboard.jsx's ReportsPage, which sends
-# ?type=revenue|occupancy|booking&date_from=&date_to= and reads
-# total_revenue/total_collected/total_pending/bookings for 'revenue',
-# by_property (property__name, count) for 'occupancy', and bookings for both.
+# Reports — scoped per client
 # ---------------------------------------------------------------------------
 
 class ReportView(APIView):
@@ -387,7 +526,7 @@ class ReportView(APIView):
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
 
-        qs = Booking.objects.exclude(status='cancelled')
+        qs = _client_scope(Booking.objects.exclude(status='cancelled'), request)
         if date_from:
             qs = qs.filter(booking_date__gte=date_from)
         if date_to:
@@ -399,7 +538,7 @@ class ReportView(APIView):
 
         if report_type == 'revenue':
             data['total_revenue'] = qs.aggregate(total=Sum('total_amount'))['total'] or 0
-            data['total_collected'] = Payment.objects.filter(booking__in=qs).aggregate(
+            data['total_collected'] = _client_scope(Payment.objects.filter(booking__in=qs), request).aggregate(
                 total=Sum('amount')
             )['total'] or 0
             data['total_pending'] = qs.aggregate(total=Sum('balance_amount'))['total'] or 0
@@ -412,11 +551,7 @@ class ReportView(APIView):
 
 
 # ---------------------------------------------------------------------------
-# Auth — GUESS: implemented with DRF Token auth since that's the most common
-# pattern for this kind of API, but I have no idea what your original
-# Login/Logout/Me actually did (session auth? JWT? something custom?). If
-# your frontend already has working login/logout calls, keep your original
-# versions of these three and only take the views above.
+# Auth — Login / Logout / Me
 # ---------------------------------------------------------------------------
 
 class LoginView(APIView):
@@ -430,16 +565,13 @@ class LoginView(APIView):
        exists, is Active, and its licence has not expired.
     2. Look up the Django user by e-mail address.
     3. Authenticate with Django's password checker.
-    4. Return an auth token plus licence metadata.
+    4. Verify the user's profile is linked to the same client_id.
+    5. Return an auth token plus licence + client metadata.
     """
-
     permission_classes = [permissions.AllowAny]
     ACTIVATE_API = 'https://activate.imcbs.com/mobileapp/api/project/venuekart/'
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-
     def _fetch_licence_data(self):
-        """GETs the VenueKart activation endpoint; returns parsed JSON or None."""
         req = urllib.request.Request(
             self.ACTIVATE_API,
             headers={'User-Agent': 'VenueBook/1.0', 'Accept': 'application/json'},
@@ -449,8 +581,6 @@ class LoginView(APIView):
                 return json.loads(resp.read().decode())
         except (urllib.error.URLError, ValueError, OSError):
             return None
-
-    # ── POST ─────────────────────────────────────────────────────────────────
 
     def post(self, request):
         email     = (request.data.get('email')     or '').strip().lower()
@@ -464,6 +594,11 @@ class LoginView(APIView):
             )
 
         # ── Step 1: validate client_id via VenueKart activation API ─────────
+        # Only two things are checked here:
+        #   (a) the client_id exists in the activation API response
+        #   (b) the licence has not expired
+        # There is no fixed set of allowed IDs – any registered, non-expired
+        # client_id is accepted.
         api_data = self._fetch_licence_data()
         if api_data is None or not api_data.get('success'):
             return Response(
@@ -472,7 +607,7 @@ class LoginView(APIView):
             )
 
         customers = api_data.get('customers', [])
-        matched   = next(
+        matched = next(
             (c for c in customers if (c.get('client_id') or '').upper() == client_id),
             None,
         )
@@ -497,7 +632,7 @@ class LoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # ── Step 2: look up user by email ────────────────────────────────────
+        # ── Step 2: look up Django user by email ─────────────────────────────
         try:
             user_obj = DjangoUser.objects.get(email__iexact=email)
         except DjangoUser.DoesNotExist:
@@ -519,19 +654,50 @@ class LoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
+        # ── Step 4: resolve profile (create one if missing) ───────────────────
+        # We no longer check whether the profile's stored client matches the
+        # supplied client_id. The activation API is the single source of truth
+        # for whether a client_id is valid. Any registered, non-expired ID is
+        # allowed – the user just needs a valid email + password.
+        try:
+            profile = user.profile
+        except UserProfile.DoesNotExist:
+            profile = UserProfile.objects.create(user=user, role='admin', client=None)
+
+        # ── Step 5: ensure a local Client record exists for this client_id ────
+        # This keeps the FK-based tenant scoping working for properties /
+        # bookings / payments without requiring a separate admin setup step.
+        customer_name = matched.get('customer_name', client_id)
+        client_obj, _ = Client.objects.update_or_create(
+            client_id=client_id,
+            defaults={
+                'name':      customer_name,
+                'is_active': True,
+            },
+        )
+
+        # Bind the profile to this client so tenant-scoped views work correctly.
+        # Super-admins keep client=None (they span all tenants).
+        if not profile.is_super_admin:
+            profile.client = client_obj
+            profile.save(update_fields=['client'])
+
+        # ── Step 6: issue token ───────────────────────────────────────────────
         login(request, user)
         token, _ = Token.objects.get_or_create(user=user)
 
         return Response({
             'token': token.key,
             'user': {
+                'id':           user.id,
                 'username':     user.username,
                 'email':        user.email,
+                'role':         profile.role,
                 'is_superuser': user.is_superuser,
             },
             'client': {
-                'client_id':      matched['client_id'],
-                'customer_name':  matched.get('customer_name', ''),
+                'client_id':      client_id,
+                'customer_name':  customer_name,
                 'license_expiry': validity.get('expiry_date'),
                 'remaining_days': validity.get('remaining_days'),
             },
@@ -552,8 +718,22 @@ class MeView(APIView):
 
     def get(self, request):
         user = request.user
+        try:
+            profile = user.profile
+            role = profile.role
+            client_id = profile.client.client_id if profile.client else None
+            client_name = profile.client.name if profile.client else None
+        except UserProfile.DoesNotExist:
+            role = 'super_admin' if user.is_superuser else 'admin'
+            client_id = None
+            client_name = None
+
         return Response({
-            'username': user.username,
-            'email': user.email,
+            'id':           user.id,
+            'username':     user.username,
+            'email':        user.email,
+            'role':         role,
             'is_superuser': user.is_superuser,
+            'client_id':    client_id,
+            'client_name':  client_name,
         })

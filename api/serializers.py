@@ -1,8 +1,113 @@
 from decimal import Decimal
 from rest_framework import serializers
 from django.db.models import Q
-from .models import Property, PropertyImage, PropertySlot, Booking, Payment
+from django.contrib.auth.models import User as DjangoUser
+from .models import Client, UserProfile, Property, PropertyImage, PropertySlot, Booking, Payment
 
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+class ClientSerializer(serializers.ModelSerializer):
+    user_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Client
+        fields = ['id', 'client_id', 'name', 'email', 'phone', 'is_active', 'created_at', 'user_count']
+        read_only_fields = ['created_at']
+
+    def get_user_count(self, obj):
+        return obj.users.count()
+
+
+# ---------------------------------------------------------------------------
+# UserProfile / User management
+# ---------------------------------------------------------------------------
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserProfile
+        fields = ['role', 'client']
+
+
+class UserSerializer(serializers.ModelSerializer):
+    """
+    Full user representation including profile. Used by super_admin user
+    management endpoints.
+    """
+    role = serializers.CharField(source='profile.role', read_only=True)
+    client_id = serializers.CharField(source='profile.client.client_id', read_only=True, allow_null=True)
+    client_name = serializers.CharField(source='profile.client.name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = DjangoUser
+        fields = ['id', 'username', 'email', 'is_active', 'role', 'client_id', 'client_name', 'date_joined']
+        read_only_fields = ['date_joined']
+
+
+class CreateUserSerializer(serializers.Serializer):
+    """
+    Used by POST /api/users/ (super_admin only). Creates a Django user +
+    UserProfile in one call. The password is write-only and hashed
+    automatically.
+    """
+    username = serializers.CharField(max_length=150)
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, min_length=8)
+    role = serializers.ChoiceField(choices=UserProfile.ROLES, default='admin')
+    # client_id is required for admin/staff; super_admin can be left blank
+    client_id = serializers.CharField(max_length=50, required=False, allow_blank=True)
+
+    def validate_username(self, value):
+        if DjangoUser.objects.filter(username=value).exists():
+            raise serializers.ValidationError("A user with that username already exists.")
+        return value
+
+    def validate_email(self, value):
+        if DjangoUser.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError("A user with that email already exists.")
+        return value
+
+    def validate(self, data):
+        role = data.get('role', 'admin')
+        client_id = data.get('client_id', '').strip().upper()
+
+        if role != 'super_admin':
+            if not client_id:
+                raise serializers.ValidationError(
+                    {"client_id": "client_id is required for admin / staff users."}
+                )
+            try:
+                data['_client'] = Client.objects.get(client_id=client_id)
+            except Client.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"client_id": f"Client '{client_id}' does not exist."}
+                )
+        else:
+            data['_client'] = None
+        return data
+
+    def create(self, validated_data):
+        client = validated_data.pop('_client')
+        validated_data.pop('client_id', None)
+
+        user = DjangoUser.objects.create_user(
+            username=validated_data['username'],
+            email=validated_data['email'],
+            password=validated_data['password'],
+        )
+        UserProfile.objects.create(
+            user=user,
+            role=validated_data.get('role', 'admin'),
+            client=client,
+        )
+        return user
+
+
+# ---------------------------------------------------------------------------
+# Property
+# ---------------------------------------------------------------------------
 
 class PropertyImageSerializer(serializers.ModelSerializer):
     class Meta:
@@ -14,20 +119,16 @@ class PropertySlotSerializer(serializers.ModelSerializer):
     class Meta:
         model = PropertySlot
         fields = [
-            'id', 'property', 'slot_type',
+            'id', 'slot_id', 'property', 'slot_type',
             'price', 'min_duration_hours', 'max_duration_hours', 'status',
         ]
-        # 'property' is set by the parent PropertySerializer when slots are
-        # created/updated as part of the property form, so it's not required
-        # on its own when nested.
+        # slot_id is auto-generated on first save — never writable via API
+        read_only_fields = ['slot_id']
         extra_kwargs = {'property': {'required': False}}
 
 
 class PropertySerializer(serializers.ModelSerializer):
     images = PropertyImageSerializer(many=True, read_only=True)
-    # Writable nested slots: this is the "tick Full Day / Half Day / Hourly"
-    # part of the property form. Send one object per ticked type, e.g.
-    # slots: [{slot_type: 'full_day', price: 25000}, {slot_type: 'hourly', price: 2000, min_duration_hours: 2}]
     slots = PropertySlotSerializer(many=True, required=False)
     primary_image = serializers.SerializerMethodField()
     total_bookings = serializers.SerializerMethodField()
@@ -35,11 +136,14 @@ class PropertySerializer(serializers.ModelSerializer):
     class Meta:
         model = Property
         fields = [
-            'id', 'name', 'property_type', 'description', 'address',
+            'id', 'property_id', 'name', 'property_type', 'description', 'address',
             'location', 'google_map_link', 'capacity', 'security_deposit', 'status',
             'images', 'slots', 'primary_image', 'total_bookings',
             'created_at', 'updated_at',
         ]
+        # client is injected by the view from request.user.profile.client
+        # property_id is auto-generated on first save — never writable via API
+        read_only_fields = ['property_id', 'created_at', 'updated_at']
 
     def get_primary_image(self, obj):
         img = obj.images.filter(is_primary=True).first() or obj.images.first()
@@ -53,6 +157,7 @@ class PropertySerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         slots_data = validated_data.pop('slots', [])
+        # 'client' must have been injected into validated_data by the view
         property_obj = Property.objects.create(**validated_data)
         for slot_data in slots_data:
             PropertySlot.objects.create(property=property_obj, **slot_data)
@@ -60,24 +165,23 @@ class PropertySerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         slots_data = validated_data.pop('slots', None)
+        validated_data.pop('client', None)   # never reassign tenant on update
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
 
         if slots_data is not None:
-            # Full replace on update: simplest + safest since slots map
-            # 1:1 to the ticked checkboxes on the property form. If you'd
-            # rather diff/preserve existing rows by id, this is the spot
-            # to change.
             instance.slots.all().delete()
             for slot_data in slots_data:
                 PropertySlot.objects.create(property=instance, **slot_data)
         return instance
 
 
+# ---------------------------------------------------------------------------
+# Payment
+# ---------------------------------------------------------------------------
+
 class PaymentSerializer(serializers.ModelSerializer):
-    # Read-only booking totals, so each payment response shows where the
-    # booking stands after this payment is applied.
     booking_total = serializers.DecimalField(
         source='booking.total_amount', max_digits=10, decimal_places=2, read_only=True)
     booking_paid = serializers.DecimalField(
@@ -96,6 +200,10 @@ class PaymentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['received_at']
 
+
+# ---------------------------------------------------------------------------
+# Booking
+# ---------------------------------------------------------------------------
 
 class BookingListSerializer(serializers.ModelSerializer):
     property_name = serializers.CharField(source='property.name', read_only=True)
@@ -132,8 +240,6 @@ class BookingDetailSerializer(serializers.ModelSerializer):
             'payment_status', 'notes', 'status',
             'payments', 'created_at', 'updated_at',
         ]
-        # total_amount/duration_hours are server-computed from the slot +
-        # time range (see validate() and Booking.save()), not client-supplied.
         read_only_fields = ['duration_hours', 'total_amount']
 
     def validate(self, data):
@@ -150,6 +256,19 @@ class BookingDetailSerializer(serializers.ModelSerializer):
 
         if property_slot.property_id != property_obj.id:
             raise serializers.ValidationError("That slot doesn't belong to the selected property.")
+
+        # ── Tenant guard: property must belong to the requesting user's client ─
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            try:
+                user_client = request.user.profile.client
+                is_super = request.user.profile.role == 'super_admin'
+            except Exception:
+                user_client, is_super = None, False
+            if not is_super and user_client and property_obj.client_id != user_client.id:
+                raise serializers.ValidationError(
+                    "You can only book properties that belong to your account."
+                )
 
         if end <= start:
             raise serializers.ValidationError("end_time must be after start_time.")
@@ -169,11 +288,8 @@ class BookingDetailSerializer(serializers.ModelSerializer):
                 )
             data['total_amount'] = Decimal(str(round(float(property_slot.price) * duration, 2)))
         else:
-            # full_day / half_day: flat price regardless of the times entered.
             data['total_amount'] = property_slot.price
 
-        # Overlap check (mirrors Booking.clean(), surfaced here so DRF
-        # returns a clean 400 instead of an uncaught ValidationError).
         conflict_qs = Booking.objects.filter(
             property=property_obj,
             booking_date=booking_date,
@@ -192,7 +308,6 @@ class BookingDetailSerializer(serializers.ModelSerializer):
 
 
 class CalendarBookingSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for calendar view."""
     property_name = serializers.CharField(source='property.name', read_only=True)
     slot_type = serializers.CharField(source='property_slot.slot_type', read_only=True)
 

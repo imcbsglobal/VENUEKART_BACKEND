@@ -1,6 +1,95 @@
 from django.db import models
+from django.contrib.auth.models import User as DjangoUser
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+
+
+# ---------------------------------------------------------------------------
+# Client — one row per VenueKart customer (tenant)
+# ---------------------------------------------------------------------------
+
+class Client(models.Model):
+    """
+    A single tenant. Every Property / Booking / Payment row belongs to
+    exactly one Client. The client_id here must match the client_id that
+    the VenueKart activation API returns.
+    """
+    client_id = models.CharField(max_length=50, unique=True)   # e.g. "VC001"
+    name = models.CharField(max_length=255)
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=20, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['client_id']
+
+    def __str__(self):
+        return f"{self.client_id} – {self.name}"
+
+
+# ---------------------------------------------------------------------------
+# UserProfile — links a Django User to a Client (tenant) + stores role
+# ---------------------------------------------------------------------------
+
+class UserProfile(models.Model):
+    ROLES = [
+        ('super_admin', 'Super Admin'),
+        ('admin',       'Admin'),
+        ('staff',       'Staff'),
+    ]
+
+    user = models.OneToOneField(DjangoUser, on_delete=models.CASCADE, related_name='profile')
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name='users',
+        null=True, blank=True,   # null only for super_admin who spans all clients
+    )
+    role = models.CharField(max_length=20, choices=ROLES, default='admin')
+
+    def __str__(self):
+        client_str = self.client.client_id if self.client else 'ALL'
+        return f"{self.user.username} [{client_str}] ({self.role})"
+
+    @property
+    def is_super_admin(self):
+        return self.role == 'super_admin'
+
+
+# ---------------------------------------------------------------------------
+# Property
+# ---------------------------------------------------------------------------
+
+def _slugify_name(name, max_chars=8):
+    """
+    Convert an arbitrary name to a compact uppercase slug for use inside IDs.
+    • Keeps only ASCII letters/digits (strips spaces, symbols, accents).
+    • Upper-cases the result and caps at *max_chars* characters.
+    Examples:
+        "Raj Hall"  → "RAJHALL"
+        "The Grand Ballroom" → "THEGRAND"
+        "Villa #2"  → "VILLA2"
+    """
+    import re
+    cleaned = re.sub(r'[^A-Za-z0-9]', '', name)
+    return cleaned.upper()[:max_chars]
+
+
+# Short type codes used inside Property IDs
+PROPERTY_TYPE_CODES = {
+    'auditorium': 'AUD',
+    'house':      'HSE',
+    'villa':      'VIL',
+    'resort':     'RST',
+    'plot':       'PLT',
+    'commercial': 'COM',
+}
+
+# Short slot-type codes used inside Slot IDs
+SLOT_TYPE_CODES = {
+    'full_day': 'FD',
+    'half_day': 'HD',
+    'hourly':   'HR',
+}
 
 
 class Property(models.Model):
@@ -17,6 +106,14 @@ class Property(models.Model):
         ('inactive', 'Inactive'),
     ]
 
+    # ── tenant scope ──────────────────────────────────────────────────────────
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='properties', null=True)
+
+    # ── human-readable unique identifier ─────────────────────────────────────
+    # Format: {CLIENT_ID}-{TYPE_CODE}-{NNN}
+    # Example: VC001-AUD-001
+    property_id = models.CharField(max_length=30, unique=True, blank=True, editable=False)
+
     name = models.CharField(max_length=255)
     property_type = models.CharField(max_length=50, choices=PROPERTY_TYPES)
     description = models.TextField(blank=True)
@@ -24,9 +121,6 @@ class Property(models.Model):
     location = models.CharField(max_length=255)
     google_map_link = models.URLField(blank=True)
     capacity = models.PositiveIntegerField()
-    # NOTE: rent_type / rent_amount removed. Pricing now lives per slot type
-    # on PropertySlot below, since each ticked type (Full Day / Half Day /
-    # Hourly) has its own price.
     security_deposit = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -36,12 +130,45 @@ class Property(models.Model):
         verbose_name_plural = 'Properties'
         ordering = ['name']
 
+    def _generate_property_id(self):
+        """
+        Build a unique property_id of the form:
+            {CLIENT_ID}-{TYPE_CODE}-{NNN}
+        e.g.  VC001-AUD-001
+
+        NNN is the next sequential number within the same client + type
+        combination (padded to 3 digits).
+        """
+        client_part = self.client.client_id if self.client else 'GEN'
+        type_code   = PROPERTY_TYPE_CODES.get(self.property_type, self.property_type[:3].upper())
+
+        prefix = f"{client_part}-{type_code}-"
+        existing = (
+            Property.objects
+            .filter(property_id__startswith=prefix)
+            .exclude(pk=self.pk)
+            .values_list('property_id', flat=True)
+        )
+        max_seq = 0
+        for pid in existing:
+            try:
+                seq = int(pid.split('-')[-1])
+                if seq > max_seq:
+                    max_seq = seq
+            except (ValueError, IndexError):
+                pass
+        return f"{prefix}{max_seq + 1:03d}"
+
+    def save(self, *args, **kwargs):
+        if not self.property_id:
+            self.property_id = self._generate_property_id()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return self.name
 
     @property
     def offered_slot_types(self):
-        """Distinct slot types this property currently offers, e.g. ['full_day', 'hourly']."""
         return list(self.slots.filter(status='active').values_list('slot_type', flat=True).distinct())
 
 
@@ -61,15 +188,6 @@ class PropertyImage(models.Model):
 
 
 class PropertySlot(models.Model):
-    """
-    Replaces the old global `Slot` model. A slot now belongs to exactly one
-    Property — ticking "Full Day" / "Half Day" / "Hourly" on the property
-    form just creates one of these rows with its own price. There's no
-    fixed time window stored here; the actual start/end time for a booking
-    is entered directly on the booking itself.
-
-    `price` is a flat fee for full_day/half_day, and PER HOUR for hourly.
-    """
     SLOT_TYPES = [
         ('full_day', 'Full Day'),
         ('half_day', 'Half Day'),
@@ -81,15 +199,54 @@ class PropertySlot(models.Model):
     ]
 
     property = models.ForeignKey(Property, on_delete=models.CASCADE, related_name='slots')
+
+    # ── human-readable unique identifier ─────────────────────────────────────
+    # Format: {CLIENT_ID}-{PROP_SLUG}-{SLOT_CODE}-{NN}
+    # Example: VC001-RAJHALL-FD-01
+    slot_id = models.CharField(max_length=40, unique=True, blank=True, editable=False)
+
     slot_type = models.CharField(max_length=20, choices=SLOT_TYPES)
     price = models.DecimalField(max_digits=10, decimal_places=2)
-
-    # Hourly-only constraints on the custom duration a customer can pick.
     min_duration_hours = models.DecimalField(max_digits=4, decimal_places=1, default=1)
     max_duration_hours = models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
-
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def _generate_slot_id(self):
+        """
+        Build a unique slot_id of the form:
+            {CLIENT_ID}-{PROP_SLUG}-{SLOT_CODE}-{NN}
+        e.g.  VC001-RAJHALL-FD-01
+
+        NN is the next sequential number within the same property + slot_type
+        combination (padded to 2 digits).
+        """
+        prop   = self.property
+        client_part = prop.client.client_id if prop.client else 'GEN'
+        prop_slug   = _slugify_name(prop.name, max_chars=8)
+        slot_code   = SLOT_TYPE_CODES.get(self.slot_type, self.slot_type[:2].upper())
+
+        prefix = f"{client_part}-{prop_slug}-{slot_code}-"
+        existing = (
+            PropertySlot.objects
+            .filter(slot_id__startswith=prefix)
+            .exclude(pk=self.pk)
+            .values_list('slot_id', flat=True)
+        )
+        max_seq = 0
+        for sid in existing:
+            try:
+                seq = int(sid.split('-')[-1])
+                if seq > max_seq:
+                    max_seq = seq
+            except (ValueError, IndexError):
+                pass
+        return f"{prefix}{max_seq + 1:02d}"
+
+    def save(self, *args, **kwargs):
+        if not self.slot_id:
+            self.slot_id = self._generate_slot_id()
+        super().save(*args, **kwargs)
 
     class Meta:
         ordering = ['property', 'slot_type']
@@ -97,6 +254,10 @@ class PropertySlot(models.Model):
     def __str__(self):
         return f"{self.property.name} – {self.get_slot_type_display()} (₹{self.price})"
 
+
+# ---------------------------------------------------------------------------
+# Booking
+# ---------------------------------------------------------------------------
 
 class Booking(models.Model):
     BOOKING_STATUS = [
@@ -125,28 +286,24 @@ class Booking(models.Model):
         ('paid', 'Fully Paid'),
     ]
 
+    # ── tenant scope ──────────────────────────────────────────────────────────
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='bookings', null=True)
+
     booking_number = models.CharField(max_length=20, unique=True, editable=False)
     property = models.ForeignKey(Property, on_delete=models.PROTECT, related_name='bookings')
     property_slot = models.ForeignKey(PropertySlot, on_delete=models.PROTECT, related_name='bookings')
 
-    # Customer Info
     customer_name = models.CharField(max_length=255)
     mobile_number = models.CharField(max_length=20)
 
-    # Event Info
     event_name = models.CharField(max_length=255)
     event_type = models.CharField(max_length=50, choices=EVENT_TYPES)
 
-    # Booking Details
     booking_date = models.DateField()
-    # Actual booked time range. For full_day/half_day this is copied from
-    # property_slot. For hourly this is the customer's custom selection
-    # (validated to fall inside property_slot's window).
     start_time = models.TimeField()
     end_time = models.TimeField()
     duration_hours = models.DecimalField(max_digits=4, decimal_places=1, editable=False, default=0)
 
-    # Payment
     total_amount = models.DecimalField(max_digits=10, decimal_places=2)
     advance_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     balance_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -162,22 +319,18 @@ class Booking(models.Model):
         ordering = ['-created_at']
 
     def save(self, *args, **kwargs):
-        # Auto-generate booking number
         if not self.booking_number:
             last = Booking.objects.order_by('-id').first()
             next_id = (last.id + 1) if last else 1
             self.booking_number = f"BK{timezone.now().strftime('%Y%m')}{next_id:04d}"
 
-        # Auto-compute duration from the actual booked time range
         if self.start_time and self.end_time:
             start_secs = self.start_time.hour * 3600 + self.start_time.minute * 60 + self.start_time.second
             end_secs = self.end_time.hour * 3600 + self.end_time.minute * 60 + self.end_time.second
             self.duration_hours = round((end_secs - start_secs) / 3600, 1)
 
-        # Auto-compute balance
         self.balance_amount = self.total_amount - self.advance_amount
 
-        # Auto-compute payment status
         if self.advance_amount <= 0:
             self.payment_status = 'pending'
         elif self.balance_amount <= 0:
@@ -188,12 +341,6 @@ class Booking(models.Model):
         super().save(*args, **kwargs)
 
     def clean(self):
-        # Overlap-based double-booking validation. This replaces the old
-        # "same slot id" check — now that Hourly bookings have custom,
-        # non-fixed time ranges, two bookings can conflict even if they
-        # picked different PropertySlot rows (or the same row at different
-        # times shouldn't conflict at all), so we compare actual time
-        # ranges for the same property + date instead.
         if self.booking_date and self.property_id and self.start_time and self.end_time:
             conflict_qs = Booking.objects.filter(
                 property_id=self.property_id,
@@ -213,6 +360,10 @@ class Booking(models.Model):
         return f"{self.booking_number} – {self.customer_name} @ {self.property.name}"
 
 
+# ---------------------------------------------------------------------------
+# Payment
+# ---------------------------------------------------------------------------
+
 class Payment(models.Model):
     PAYMENT_METHODS = [
         ('cash', 'Cash'),
@@ -221,6 +372,9 @@ class Payment(models.Model):
         ('cheque', 'Cheque'),
         ('other', 'Other'),
     ]
+
+    # ── tenant scope (denormalised from booking.client for fast filtering) ───
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='payments', null=True)
 
     booking = models.ForeignKey(Booking, on_delete=models.CASCADE, related_name='payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2)
@@ -231,15 +385,12 @@ class Payment(models.Model):
     received_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
+        # Inherit client from the booking automatically so callers don't
+        # have to pass it explicitly.
+        if not self.client_id:
+            self.client = self.booking.client
         is_new = self.pk is None
         super().save(*args, **kwargs)
-
-        # Recording a NEW payment rolls it straight into the booking's
-        # advance_amount, which re-triggers Booking.save()'s automatic
-        # balance_amount / payment_status recalculation. Editing an
-        # existing Payment row (e.g. fixing a typo in notes) intentionally
-        # does NOT touch the booking total again here, so re-saving an old
-        # payment can't double-count it.
         if is_new:
             booking = self.booking
             booking.advance_amount = (booking.advance_amount or 0) + self.amount
@@ -249,10 +400,6 @@ class Payment(models.Model):
         booking = self.booking
         amount = self.amount
         super().delete(*args, **kwargs)
-
-        # Mirror image of save(): removing a payment (e.g. deleting a
-        # mistaken entry from the admin) gives the amount back to the
-        # balance instead of leaving it permanently "paid".
         booking.advance_amount = max(booking.advance_amount - amount, 0)
         booking.save()
 
