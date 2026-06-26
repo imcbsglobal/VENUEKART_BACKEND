@@ -228,10 +228,10 @@ class BookingViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(property__client=client)
 
         status_param = self.request.query_params.get('status')
-        property_id = self.request.query_params.get('property')
-        date_from = self.request.query_params.get('date_from')
-        date_to = self.request.query_params.get('date_to')
-        search = self.request.query_params.get('search')
+        property_id  = self.request.query_params.get('property')
+        date_from    = self.request.query_params.get('date_from')
+        date_to      = self.request.query_params.get('date_to')
+        search       = self.request.query_params.get('search')
 
         if status_param:
             qs = qs.filter(status=status_param)
@@ -269,7 +269,6 @@ class BookingViewSet(viewsets.ModelViewSet):
                 raise DRFValidationError({"client_id": f"Client '{client_id}' not found."})
 
         # ── Guard: the chosen property must belong to the same client ─────────
-        # This prevents a booking being created against another tenant's property.
         property_id = self.request.data.get('property')
         if property_id:
             from .models import Property as PropertyModel
@@ -293,11 +292,227 @@ class BookingViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(out.data)
         return Response(out.data, status=status.HTTP_201_CREATED, headers=headers)
 
+    # ── Availability pre-check ────────────────────────────────────────────────
+    @action(detail=False, methods=['post'], url_path='check-availability')
+    def check_availability(self, request):
+        """
+        POST /api/bookings/check-availability/
+
+        Pre-flight availability check. Call this before submitting the booking
+        form to confirm the slot is free and receive the computed total_amount.
+
+        Request body:
+        {
+            "property":      <int>   — property pk,
+            "property_slot": <int>   — slot pk,
+            "booking_date":  "YYYY-MM-DD",
+            "start_time":    "HH:MM",
+            "end_time":      "HH:MM"
+        }
+
+        Success response  (HTTP 200):
+        {
+            "available":       true,
+            "property":        <int>,
+            "property_name":   "Raj Hall",
+            "property_type":   "auditorium",
+            "slot_type":       "hourly",
+            "slot_type_label": "Hourly",
+            "booking_date":    "2025-08-15",
+            "start_time":      "10:00",
+            "end_time":        "14:00",
+            "duration_hours":  4.0,
+            "total_amount":    "8000.00",
+            "reason":          ""
+        }
+
+        Failure response  (HTTP 200 with available=false  OR  4xx):
+        {
+            "available": false,
+            "reason":    "This Hourly slot is already reserved on 2025-08-15 (booking BK202508XXXX)."
+        }
+        """
+        from decimal import Decimal as D
+
+        property_id  = request.data.get('property')
+        slot_id      = request.data.get('property_slot')
+        date_str     = request.data.get('booking_date')
+        start_str    = request.data.get('start_time')
+        end_str      = request.data.get('end_time')
+
+        # ── 1. Required-field check ───────────────────────────────────────────
+        missing = [
+            f for f, v in [
+                ('property',      property_id),
+                ('property_slot', slot_id),
+                ('booking_date',  date_str),
+                ('start_time',    start_str),
+                ('end_time',      end_str),
+            ] if not v
+        ]
+        if missing:
+            return Response(
+                {'available': False, 'reason': f"Missing required fields: {', '.join(missing)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── 2. Parse date / times ─────────────────────────────────────────────
+        try:
+            booking_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'available': False, 'reason': 'booking_date must be in YYYY-MM-DD format.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            start = datetime.strptime(start_str, '%H:%M').time()
+            end   = datetime.strptime(end_str,   '%H:%M').time()
+        except ValueError:
+            return Response(
+                {'available': False, 'reason': 'start_time and end_time must be in HH:MM format.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if end <= start:
+            return Response(
+                {'available': False, 'reason': 'end_time must be after start_time.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── 3. Fetch property (tenant-scoped) ─────────────────────────────────
+        try:
+            prop_qs = Property.objects.all()
+            if not _is_super(request):
+                prop_qs = prop_qs.filter(client=_get_client(request))
+            property_obj = prop_qs.get(pk=property_id)
+        except Property.DoesNotExist:
+            return Response(
+                {'available': False, 'reason': 'Property not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ── 4. Fetch slot ─────────────────────────────────────────────────────
+        try:
+            slot = PropertySlot.objects.get(pk=slot_id, property=property_obj, status='active')
+        except PropertySlot.DoesNotExist:
+            return Response(
+                {'available': False, 'reason': 'Slot not found or inactive for this property.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ── 5. Duration + total_amount calculation ────────────────────────────
+        if slot.slot_type == 'hourly':
+            duration_secs = (
+                end.hour * 3600 + end.minute * 60
+                - start.hour * 3600 - start.minute * 60
+            )
+            duration = duration_secs / 3600
+
+            if duration < float(slot.min_duration_hours):
+                return Response({
+                    'available': False,
+                    'reason': (
+                        f"Minimum booking duration for this slot is "
+                        f"{slot.min_duration_hours} hour(s)."
+                    ),
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if slot.max_duration_hours and duration > float(slot.max_duration_hours):
+                return Response({
+                    'available': False,
+                    'reason': (
+                        f"Maximum booking duration for this slot is "
+                        f"{slot.max_duration_hours} hour(s)."
+                    ),
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_amount = D(str(round(float(slot.price) * duration, 2)))
+        else:
+            duration     = None
+            total_amount = slot.price
+
+        # ── 6. Double-booking checks (mirrors BookingDetailSerializer.validate) ─
+        day_qs = Booking.objects.filter(
+            property=property_obj,
+            booking_date=booking_date,
+        ).exclude(status='cancelled')
+
+        def _overlapping(qs):
+            return qs.exclude(Q(end_time__lte=start) | Q(start_time__gte=end))
+
+        # Rule 1 — existing full-day booking locks the whole property
+        if day_qs.filter(property_slot__slot_type='full_day').exists():
+            return Response({
+                'available': False,
+                'reason': (
+                    f"'{property_obj.name}' is fully booked on {booking_date}. "
+                    f"No other booking can be made on this date."
+                ),
+            })
+
+        # Rule 2 — can't add a full-day booking if any booking already exists
+        if slot.slot_type == 'full_day' and day_qs.exists():
+            return Response({
+                'available': False,
+                'reason': (
+                    f"'{property_obj.name}' already has a booking on {booking_date}. "
+                    f"A full-day booking is not possible."
+                ),
+            })
+
+        # Rule 3 — exact slot clash
+        slot_qs    = day_qs.filter(property_slot=slot)
+        slot_clash = (
+            slot_qs if slot.slot_type in ('full_day', 'half_day')
+            else _overlapping(slot_qs)
+        )
+        existing = slot_clash.first()
+        if existing:
+            return Response({
+                'available': False,
+                'reason': (
+                    f"This {slot.get_slot_type_display()} slot is already reserved on "
+                    f"{booking_date} (booking {existing.booking_number}). "
+                    f"Please choose a different slot or date."
+                ),
+            })
+
+        # Rule 4 — catch-all time overlap with any other slot on the same property
+        time_clash = _overlapping(day_qs).first()
+        if time_clash:
+            return Response({
+                'available': False,
+                'reason': (
+                    f"The selected time window overlaps with an existing booking on "
+                    f"{booking_date} "
+                    f"({time_clash.start_time.strftime('%H:%M')}–"
+                    f"{time_clash.end_time.strftime('%H:%M')}, "
+                    f"booking {time_clash.booking_number})."
+                ),
+            })
+
+        # ── 7. All clear ──────────────────────────────────────────────────────
+        return Response({
+            'available':       True,
+            'reason':          '',
+            'property':        property_obj.id,
+            'property_name':   property_obj.name,
+            'property_type':   property_obj.property_type,
+            'slot_type':       slot.slot_type,
+            'slot_type_label': slot.get_slot_type_display(),
+            'booking_date':    date_str,
+            'start_time':      start_str,
+            'end_time':        end_str,
+            'duration_hours':  duration,
+            'total_amount':    str(total_amount),
+        })
+
     @action(detail=True, methods=['patch'], url_path='status')
     def update_status(self, request, pk=None):
         booking = self.get_object()
         new_status = request.data.get('status')
-        valid_statuses = [c[0] for c in Booking.BOOKING_STATUS]  # reserved, completed, cancelled
+        valid_statuses = [c[0] for c in Booking.BOOKING_STATUS]
         if new_status not in valid_statuses:
             return Response(
                 {'error': f"Invalid status. Must be one of: {', '.join(valid_statuses)}."},
@@ -348,8 +563,8 @@ class EnquiryViewSet(viewsets.ModelViewSet):
         qs = _client_scope(super().get_queryset(), self.request, field='client')
 
         status_param = self.request.query_params.get('status')
-        property_id = self.request.query_params.get('property')
-        search = self.request.query_params.get('search')
+        property_id  = self.request.query_params.get('property')
+        search       = self.request.query_params.get('search')
 
         if status_param:
             qs = qs.filter(status=status_param)
@@ -394,13 +609,16 @@ class EnquiryViewSet(viewsets.ModelViewSet):
         enquiry = self.get_object()
 
         if enquiry.status == 'reserved':
-            return Response({'detail': 'This enquiry has already been promoted to a booking.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'detail': 'This enquiry has already been promoted to a booking.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         missing = [f for f, v in [
             ('property_slot', enquiry.property_slot_id),
-            ('enquiry_date', enquiry.enquiry_date),
-            ('start_time', enquiry.start_time),
-            ('end_time', enquiry.end_time),
+            ('enquiry_date',  enquiry.enquiry_date),
+            ('start_time',    enquiry.start_time),
+            ('end_time',      enquiry.end_time),
         ] if not v]
         if missing:
             return Response(
@@ -408,16 +626,22 @@ class EnquiryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        slot = enquiry.property_slot
+        slot  = enquiry.property_slot
         start = enquiry.start_time
-        end = enquiry.end_time
+        end   = enquiry.end_time
 
         if end <= start:
-            return Response({'detail': 'end_time must be after start_time.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'detail': 'end_time must be after start_time.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Calculate total amount
         if slot.slot_type == 'hourly':
-            duration = (end.hour * 3600 + end.minute * 60 - start.hour * 3600 - start.minute * 60) / 3600
+            duration = (
+                end.hour * 3600 + end.minute * 60
+                - start.hour * 3600 - start.minute * 60
+            ) / 3600
             total = Decimal(str(round(float(slot.price) * duration, 2)))
         else:
             total = slot.price
@@ -458,11 +682,11 @@ class EnquiryViewSet(viewsets.ModelViewSet):
         )
 
         enquiry.booking = booking
-        enquiry.status = 'reserved'
+        enquiry.status  = 'reserved'
         enquiry.save(update_fields=['booking', 'status', 'updated_at'])
 
         return Response({
-            'detail': 'Enquiry promoted to booking successfully.',
+            'detail':  'Enquiry promoted to booking successfully.',
             'booking': BookingListSerializer(booking).data,
             'enquiry': EnquirySerializer(enquiry).data,
         }, status=status.HTTP_201_CREATED)
@@ -494,18 +718,23 @@ class AvailabilityCheckView(APIView):
 
     def get(self, request):
         property_id = request.query_params.get('property')
-        date_str = request.query_params.get('date')
+        date_str    = request.query_params.get('date')
 
         if not property_id or not date_str:
-            return Response({'error': 'property and date are required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'property and date are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             booking_date = datetime.strptime(date_str, '%Y-%m-%d').date()
         except ValueError:
-            return Response({'error': 'date must be in YYYY-MM-DD format.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'date must be in YYYY-MM-DD format.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            # Scoping: only let users check availability for their own client's properties
             qs = Property.objects.all()
             if not _is_super(request):
                 client = _get_client(request)
@@ -522,15 +751,103 @@ class AvailabilityCheckView(APIView):
 
         busy_ranges = [
             {
-                'start': b.start_time.strftime('%H:%M'),
-                'end': b.end_time.strftime('%H:%M'),
+                'start':          b.start_time.strftime('%H:%M'),
+                'end':            b.end_time.strftime('%H:%M'),
                 'booking_number': b.booking_number,
-                'customer_name': b.customer_name,
+                'customer_name':  b.customer_name,
             }
             for b in existing
         ]
 
-        return Response({'property': property_obj.id, 'date': date_str, 'busy_ranges': busy_ranges})
+        return Response({
+            'property':    property_obj.id,
+            'date':        date_str,
+            'busy_ranges': busy_ranges,
+        })
+
+
+class DateAvailabilityView(APIView):
+    """
+    Date-first booking flow.
+
+    GET /availability/?date=YYYY-MM-DD
+
+    Returns every active property the user may book, each with its slots and a
+    per-slot `available` flag for that date. Mirrors the double-booking rules in
+    BookingDetailSerializer.validate():
+      • A full-day booking locks the whole property for the date.
+      • A full-day slot is only bookable on a completely empty date.
+      • A half-day slot is unavailable once that exact slot is taken that date.
+      • Hourly slots stay listed (the exact time window is validated on submit).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        date_str = request.query_params.get('date')
+        if not date_str:
+            return Response({'error': 'date is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            booking_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'error': 'date must be in YYYY-MM-DD format.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        props = Property.objects.filter(status='active').prefetch_related('slots')
+        if not _is_super(request):
+            client = _get_client(request)
+            props = props.filter(client=client)
+
+        # Non-cancelled bookings on this date, grouped per property.
+        booked = (
+            Booking.objects
+            .filter(booking_date=booking_date)
+            .exclude(status='cancelled')
+            .values('property_id', 'property_slot_id', 'property_slot__slot_type')
+        )
+        by_prop = {}
+        for b in booked:
+            entry = by_prop.setdefault(
+                b['property_id'], {'has_full_day': False, 'slot_ids': set(), 'count': 0}
+            )
+            entry['count'] += 1
+            entry['slot_ids'].add(b['property_slot_id'])
+            if b['property_slot__slot_type'] == 'full_day':
+                entry['has_full_day'] = True
+
+        out = []
+        for p in props:
+            info = by_prop.get(p.id, {'has_full_day': False, 'slot_ids': set(), 'count': 0})
+            slots_out = []
+            for s in p.slots.all():
+                if s.status != 'active':
+                    continue
+                available, reason = True, ''
+                if info['has_full_day']:
+                    available, reason = False, 'Property is booked for the full day'
+                elif s.slot_type == 'full_day' and info['count'] > 0:
+                    available, reason = False, 'Date already has bookings'
+                elif s.slot_type == 'half_day' and s.id in info['slot_ids']:
+                    available, reason = False, 'This slot is already booked'
+                slots_out.append({
+                    'id':              s.id,
+                    'slot_type':       s.slot_type,
+                    'slot_type_label': s.get_slot_type_display(),
+                    'price':           str(s.price),
+                    'available':       available,
+                    'reason':          reason,
+                })
+            out.append({
+                'id':            p.id,
+                'name':          p.name,
+                'property_type': p.property_type,
+                'location':      p.location,
+                'available':     any(sl['available'] for sl in slots_out),
+                'slots':         slots_out,
+            })
+
+        return Response({'date': date_str, 'properties': out})
 
 
 # ---------------------------------------------------------------------------
@@ -538,9 +855,10 @@ class AvailabilityCheckView(APIView):
 # ---------------------------------------------------------------------------
 
 STATUS_COLORS = {
-    'reserved': '#F59E0B', 'completed': '#10B981', 'cancelled': '#374151',
-    # Enquiry statuses (used in calendar for promoted enquiries)
-    'enquiry': '#6B7280',
+    'reserved':  '#F59E0B',
+    'completed': '#10B981',
+    'cancelled': '#374151',
+    'enquiry':   '#6B7280',
 }
 
 
@@ -548,9 +866,9 @@ class CalendarView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        today = timezone.now().date()
-        month = int(request.query_params.get('month', today.month))
-        year = int(request.query_params.get('year', today.year))
+        today      = timezone.now().date()
+        month      = int(request.query_params.get('month', today.month))
+        year       = int(request.query_params.get('year',  today.year))
         property_id = request.query_params.get('property')
 
         qs = _client_scope(
@@ -567,22 +885,22 @@ class CalendarView(APIView):
         events = []
         for b in qs:
             events.append({
-                'id': b.id,
-                'title': f"{b.booking_number} — {b.customer_name}",
-                'start': datetime.combine(b.booking_date, b.start_time).isoformat(),
-                'end': datetime.combine(b.booking_date, b.end_time).isoformat(),
+                'id':              b.id,
+                'title':           f"{b.booking_number} — {b.customer_name}",
+                'start':           datetime.combine(b.booking_date, b.start_time).isoformat(),
+                'end':             datetime.combine(b.booking_date, b.end_time).isoformat(),
                 'backgroundColor': STATUS_COLORS.get(b.status, '#6B7280'),
                 'extendedProps': {
                     'booking_number': b.booking_number,
-                    'customer_name': b.customer_name,
-                    'event_name': b.event_name,
-                    'event_type': b.event_type,
-                    'property_id': b.property_id,
-                    'property_name': b.property.name,
-                    'slot_type': b.property_slot.slot_type,
-                    'status': b.status,
+                    'customer_name':  b.customer_name,
+                    'event_name':     b.event_name,
+                    'event_type':     b.event_type,
+                    'property_id':    b.property_id,
+                    'property_name':  b.property.name,
+                    'slot_type':      b.property_slot.slot_type,
+                    'status':         b.status,
                     'payment_status': b.payment_status,
-                    'total_amount': float(b.total_amount),
+                    'total_amount':   float(b.total_amount),
                 },
             })
 
@@ -597,17 +915,17 @@ class DashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        today = timezone.now().date()
+        today       = timezone.now().date()
         month_start = today.replace(day=1)
 
         properties = _client_scope(Property.objects.all(), request)
-        bookings = _client_scope(Booking.objects.exclude(status='cancelled'), request)
-        payments = _client_scope(Payment.objects.all(), request)
+        bookings   = _client_scope(Booking.objects.exclude(status='cancelled'), request)
+        payments   = _client_scope(Payment.objects.all(), request)
 
-        total_properties = properties.count()
-        active_properties = properties.filter(status='active').count()
-        total_bookings = bookings.count()
-        today_bookings = bookings.filter(booking_date=today).count()
+        total_properties    = properties.count()
+        active_properties   = properties.filter(status='active').count()
+        total_bookings      = bookings.count()
+        today_bookings      = bookings.filter(booking_date=today).count()
         this_month_bookings = bookings.filter(booking_date__gte=month_start).count()
 
         occupied_slots = bookings.filter(
@@ -615,13 +933,15 @@ class DashboardView(APIView):
             status__in=['reserved', 'booked', 'confirmed', 'occupied'],
         ).count()
 
-        total_revenue = payments.aggregate(total=Sum('amount'))['total'] or 0
+        total_revenue    = payments.aggregate(total=Sum('amount'))['total'] or 0
         pending_payments = bookings.aggregate(total=Sum('balance_amount'))['total'] or 0
 
         active_slot_count = PropertySlot.objects.filter(
             status='active', property__in=properties
         ).count()
-        occupancy_rate = round((occupied_slots / active_slot_count) * 100, 1) if active_slot_count else 0.0
+        occupancy_rate = (
+            round((occupied_slots / active_slot_count) * 100, 1) if active_slot_count else 0.0
+        )
 
         recent_bookings = bookings.order_by('-created_at')[:5]
         upcoming_events = bookings.filter(
@@ -643,22 +963,26 @@ class DashboardView(APIView):
             revenue = payments.filter(
                 payment_date__year=y, payment_date__month=m
             ).aggregate(total=Sum('amount'))['total'] or 0
-            monthly_revenue.append({'month': calendar.month_abbr[m], 'year': y, 'revenue': float(revenue)})
+            monthly_revenue.append({
+                'month':   calendar.month_abbr[m],
+                'year':    y,
+                'revenue': float(revenue),
+            })
 
         data = {
-            'total_properties': total_properties,
-            'active_properties': active_properties,
-            'total_bookings': total_bookings,
-            'today_bookings': today_bookings,
+            'total_properties':    total_properties,
+            'active_properties':   active_properties,
+            'total_bookings':      total_bookings,
+            'today_bookings':      today_bookings,
             'this_month_bookings': this_month_bookings,
-            'occupied_slots': occupied_slots,
-            'total_revenue': total_revenue,
-            'pending_payments': pending_payments,
-            'occupancy_rate': occupancy_rate,
-            'recent_bookings': recent_bookings,
-            'upcoming_events': upcoming_events,
-            'status_breakdown': status_breakdown,
-            'monthly_revenue': monthly_revenue,
+            'occupied_slots':      occupied_slots,
+            'total_revenue':       total_revenue,
+            'pending_payments':    pending_payments,
+            'occupancy_rate':      occupancy_rate,
+            'recent_bookings':     recent_bookings,
+            'upcoming_events':     upcoming_events,
+            'status_breakdown':    status_breakdown,
+            'monthly_revenue':     monthly_revenue,
         }
         return Response(DashboardSerializer(data).data)
 
@@ -672,8 +996,8 @@ class ReportView(APIView):
 
     def get(self, request):
         report_type = request.query_params.get('type', 'revenue')
-        date_from = request.query_params.get('date_from')
-        date_to = request.query_params.get('date_to')
+        date_from   = request.query_params.get('date_from')
+        date_to     = request.query_params.get('date_to')
 
         qs = _client_scope(Booking.objects.exclude(status='cancelled'), request)
         if date_from:
@@ -686,10 +1010,11 @@ class ReportView(APIView):
         }
 
         if report_type == 'revenue':
-            data['total_revenue'] = qs.aggregate(total=Sum('total_amount'))['total'] or 0
-            data['total_collected'] = _client_scope(Payment.objects.filter(booking__in=qs), request).aggregate(
-                total=Sum('amount')
-            )['total'] or 0
+            data['total_revenue']   = qs.aggregate(total=Sum('total_amount'))['total'] or 0
+            data['total_collected'] = (
+                _client_scope(Payment.objects.filter(booking__in=qs), request)
+                .aggregate(total=Sum('amount'))['total'] or 0
+            )
             data['total_pending'] = qs.aggregate(total=Sum('balance_amount'))['total'] or 0
         elif report_type == 'occupancy':
             data['by_property'] = list(
@@ -743,11 +1068,6 @@ class LoginView(APIView):
             )
 
         # ── Step 1: validate client_id via VenueKart activation API ─────────
-        # Only two things are checked here:
-        #   (a) the client_id exists in the activation API response
-        #   (b) the licence has not expired
-        # There is no fixed set of allowed IDs – any registered, non-expired
-        # client_id is accepted.
         api_data = self._fetch_licence_data()
         if api_data is None or not api_data.get('success'):
             return Response(
@@ -804,18 +1124,12 @@ class LoginView(APIView):
             )
 
         # ── Step 4: resolve profile (create one if missing) ───────────────────
-        # We no longer check whether the profile's stored client matches the
-        # supplied client_id. The activation API is the single source of truth
-        # for whether a client_id is valid. Any registered, non-expired ID is
-        # allowed – the user just needs a valid email + password.
         try:
             profile = user.profile
         except UserProfile.DoesNotExist:
             profile = UserProfile.objects.create(user=user, role='admin', client=None)
 
         # ── Step 5: ensure a local Client record exists for this client_id ────
-        # This keeps the FK-based tenant scoping working for properties /
-        # bookings / payments without requiring a separate admin setup step.
         customer_name = matched.get('customer_name', client_id)
         client_obj, _ = Client.objects.update_or_create(
             client_id=client_id,
@@ -826,7 +1140,6 @@ class LoginView(APIView):
         )
 
         # Bind the profile to this client so tenant-scoped views work correctly.
-        # Super-admins keep client=None (they span all tenants).
         if not profile.is_super_admin:
             profile.client = client_obj
             profile.save(update_fields=['client'])
@@ -868,13 +1181,13 @@ class MeView(APIView):
     def get(self, request):
         user = request.user
         try:
-            profile = user.profile
-            role = profile.role
-            client_id = profile.client.client_id if profile.client else None
-            client_name = profile.client.name if profile.client else None
+            profile     = user.profile
+            role        = profile.role
+            client_id   = profile.client.client_id if profile.client else None
+            client_name = profile.client.name      if profile.client else None
         except UserProfile.DoesNotExist:
-            role = 'super_admin' if user.is_superuser else 'admin'
-            client_id = None
+            role        = 'super_admin' if user.is_superuser else 'admin'
+            client_id   = None
             client_name = None
 
         return Response({

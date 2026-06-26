@@ -243,11 +243,11 @@ class BookingDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['duration_hours', 'total_amount']
 
     def validate(self, data):
-        property_obj = data.get('property') or getattr(self.instance, 'property', None)
-        property_slot = data.get('property_slot') or getattr(self.instance, 'property_slot', None)
-        booking_date = data.get('booking_date') or getattr(self.instance, 'booking_date', None)
-        start = data.get('start_time') or getattr(self.instance, 'start_time', None)
-        end = data.get('end_time') or getattr(self.instance, 'end_time', None)
+        property_obj   = data.get('property')   or getattr(self.instance, 'property', None)
+        property_slot  = data.get('property_slot') or getattr(self.instance, 'property_slot', None)
+        booking_date   = data.get('booking_date')  or getattr(self.instance, 'booking_date', None)
+        start          = data.get('start_time')    or getattr(self.instance, 'start_time', None)
+        end            = data.get('end_time')      or getattr(self.instance, 'end_time', None)
 
         if not (property_obj and property_slot and booking_date and start and end):
             raise serializers.ValidationError(
@@ -273,6 +273,7 @@ class BookingDetailSerializer(serializers.ModelSerializer):
         if end <= start:
             raise serializers.ValidationError("end_time must be after start_time.")
 
+        # ── Duration & total_amount calculation ───────────────────────────────
         if property_slot.slot_type == 'hourly':
             duration = (
                 end.hour * 3600 + end.minute * 60
@@ -290,19 +291,69 @@ class BookingDetailSerializer(serializers.ModelSerializer):
         else:
             data['total_amount'] = property_slot.price
 
-        conflict_qs = Booking.objects.filter(
+        # ── Availability check (double-booking guard) ─────────────────────────
+        # Every non-cancelled booking for this property on this date.
+        # Cancelled bookings free the slot, so they are ignored.
+        day_qs = Booking.objects.filter(
             property=property_obj,
             booking_date=booking_date,
-            status__in=['reserved'],
-        ).exclude(
-            Q(end_time__lte=start) | Q(start_time__gte=end)
-        )
+        ).exclude(status='cancelled')
         if self.instance:
-            conflict_qs = conflict_qs.exclude(pk=self.instance.pk)
-        if conflict_qs.exists():
-            raise serializers.ValidationError(
-                "Booking cannot be created because it overlaps with an existing booking for this property."
-            )
+            day_qs = day_qs.exclude(pk=self.instance.pk)
+
+        def _overlapping(qs):
+            # Two windows clash unless one ends before the other starts.
+            return qs.exclude(Q(end_time__lte=start) | Q(start_time__gte=end))
+
+        # 1) An existing full-day booking locks the whole property for the date.
+        if day_qs.filter(property_slot__slot_type='full_day').exists():
+            raise serializers.ValidationError({
+                'booking_date': (
+                    f"This property is already fully booked on {booking_date}. "
+                    f"No other booking can be made on this date."
+                )
+            })
+
+        # 2) A new full-day booking can't be made if anything else exists that date.
+        if property_slot.slot_type == 'full_day' and day_qs.exists():
+            raise serializers.ValidationError({
+                'booking_date': (
+                    f"This property already has a booking on {booking_date}, "
+                    f"so a full-day booking isn't possible."
+                )
+            })
+
+        # 3) Exact slot + date lock.
+        #    Full/half-day slots are exclusive for the whole date;
+        #    hourly slots only clash when the time window overlaps.
+        slot_qs = day_qs.filter(property_slot=property_slot)
+        slot_clash = (
+            slot_qs if property_slot.slot_type in ('full_day', 'half_day')
+            else _overlapping(slot_qs)
+        )
+        existing = slot_clash.first()
+        if existing:
+            raise serializers.ValidationError({
+                'property_slot': (
+                    f"This {property_slot.get_slot_type_display()} slot is already "
+                    f"reserved on {booking_date} (booking {existing.booking_number}). "
+                    f"Please pick another slot or date."
+                )
+            })
+
+        # 4) Catch-all: any time overlap with another slot on the same property
+        #    (e.g. a half-day booking clashing with an hourly one).
+        time_clash = _overlapping(day_qs).first()
+        if time_clash:
+            raise serializers.ValidationError({
+                'start_time': (
+                    f"This time window clashes with an existing booking on "
+                    f"{booking_date} "
+                    f"({time_clash.start_time.strftime('%H:%M')}–"
+                    f"{time_clash.end_time.strftime('%H:%M')}, "
+                    f"booking {time_clash.booking_number})."
+                )
+            })
 
         return data
 
